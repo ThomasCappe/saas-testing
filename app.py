@@ -218,6 +218,15 @@ if submit:
                 
                 st.subheader("📊 Détails des ventes")
                 st.dataframe(df)
+
+                # Affichage d'une carte des ventes
+                if "Latitude" not in df.columns:
+                    df_latlon = df.copy()
+                    df_latlon[["Latitude", "Longitude"]] = df_latlon["Adresse"].apply(lambda x: pd.Series(geocode_address(x)), 1)
+                    df = pd.concat([df, df_latlon[["Latitude", "Longitude"]]], axis=1)
+                df_valid_coords = df.dropna(subset=["Latitude", "Longitude"])
+                if not df_valid_coords.empty:
+                    st.map(df_valid_coords.rename(columns={"Latitude": "lat", "Longitude": "lon"}))
                 def get_nearby_pois(lat, lon, radius=2000):
                     query = f"""
                     [out:json];

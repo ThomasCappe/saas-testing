@@ -196,7 +196,6 @@ if submit:
                 st.info(f"🏡 D’après notre analyse du marché local, votre bien est estimé entre **{round(estim * 0.9)} €** et **{round(estim * 1.1)} €**. Cette fourchette reflète les tendances récentes observées dans votre zone géographique, en tenant compte du type de bien, de sa surface et de son état. Pour une estimation précise et adaptée à votre bien, n'hésitez pas à consulter un professionnel de l'immobilier qui pourra affiner cette analyse selon ses caractéristiques uniques.")
                 if note:
                     st.markdown(f"💬 {note}")
-                progress.progress(100)
                 st.write(f"Basée sur {nb} ventes comparables")
 
                 
@@ -267,6 +266,7 @@ if submit:
                 # Analyse déplacée ici en bas
                 st.subheader("📉 Analyse")
                 st.line_chart(moy)
+                progress.progress(100)
 
 # Interface administrateur
 if st.sidebar.checkbox("🔐 Mode Admin"):

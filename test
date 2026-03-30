@@ -59,7 +59,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
 
 
 CONFIG = load_config()
-app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="7.0.0")
+app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="8.0.0")
 
 
 def get_proxy_external_base(request: Request) -> str:
@@ -181,15 +181,11 @@ def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
 
         # If incoming path already contains the repo path prefix from the Hub,
         # strip it to avoid duplicating it when joining with base_url.
-        # Example:
-        # base_url   = https://hub/api/galaxy/content/community/
-        # path       = /api/galaxy/content/community/v3/collections/...
-        # final path must become only /v3/collections/... before joining.
         if base_path and upstream_path.startswith(base_path + "/"):
             upstream_path = upstream_path[len(base_path):]
             upstream_path = "/" + upstream_path.lstrip("/")
 
-        # Fallback: if the path is a plain /api/... path, remove leading /api
+        # Fallback: if path starts with /api/, strip only that prefix for Hub-like repos
         elif upstream_path.startswith("/api/"):
             upstream_path = upstream_path[len("/api/"):]
             upstream_path = "/" + upstream_path.lstrip("/")
@@ -339,6 +335,9 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
     last_response = None
     last_repo = None
 
+    # Retry on those statuses before giving answer back to ansible-galaxy
+    retryable_statuses = {403, 404, 502, 503}
+
     for repo in candidate_repos:
         upstream_url = build_upstream_url(repo, path, request.scope.get("query_string", b""))
         headers = build_upstream_headers(request, repo)
@@ -387,11 +386,15 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
         last_response = upstream_response
         last_repo = repo
 
-        # fallback only on 404
-        if upstream_response.status_code != 404:
+        if upstream_response.status_code not in retryable_statuses:
             break
 
-        logger.warning("repo returned 404, trying next repo repo=%s path=%s", repo.name, path)
+        logger.warning(
+            "repo returned retryable status=%s, trying next repo repo=%s path=%s",
+            upstream_response.status_code,
+            repo.name,
+            path,
+        )
 
     if last_response is None or last_repo is None:
         raise HTTPException(status_code=502, detail="All upstream repos failed to respond")

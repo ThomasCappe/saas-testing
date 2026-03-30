@@ -59,7 +59,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
 
 
 CONFIG = load_config()
-app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="6.0.0")
+app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="7.0.0")
 
 
 def get_proxy_external_base(request: Request) -> str:
@@ -173,13 +173,27 @@ def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
 
 def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
     upstream_path = path
-
-    # For Hub-like repos, remove leading /api because base_url already contains Hub API entrypoint
-    if repo.strip_api_prefix and upstream_path.startswith("/api/"):
-        upstream_path = upstream_path[len("/api/"):]
-        upstream_path = "/" + upstream_path.lstrip("/")
-
     base = repo.base_url.rstrip("/") + "/"
+
+    if repo.strip_api_prefix:
+        base_parsed = urlparse(repo.base_url)
+        base_path = base_parsed.path.rstrip("/")
+
+        # If incoming path already contains the repo path prefix from the Hub,
+        # strip it to avoid duplicating it when joining with base_url.
+        # Example:
+        # base_url   = https://hub/api/galaxy/content/community/
+        # path       = /api/galaxy/content/community/v3/collections/...
+        # final path must become only /v3/collections/... before joining.
+        if base_path and upstream_path.startswith(base_path + "/"):
+            upstream_path = upstream_path[len(base_path):]
+            upstream_path = "/" + upstream_path.lstrip("/")
+
+        # Fallback: if the path is a plain /api/... path, remove leading /api
+        elif upstream_path.startswith("/api/"):
+            upstream_path = upstream_path[len("/api/"):]
+            upstream_path = "/" + upstream_path.lstrip("/")
+
     upstream = urljoin(base, upstream_path.lstrip("/"))
 
     if query_string:

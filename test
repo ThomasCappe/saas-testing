@@ -106,23 +106,35 @@ def rewrite_json_urls(value, repo: RepoConfig, proxy_base: str):
     if isinstance(value, list):
         return [rewrite_json_urls(v, repo, proxy_base) for v in value]
     if isinstance(value, str):
+        parsed = urlparse(value)
+
+        # Case 1: exact match on configured repo base URL.
         if value.startswith(repo.base_url):
             rewritten = proxy_base + value[len(repo.base_url):]
-            logger.info("rewriting absolute url old=%s new=%s", value, rewritten)
+            logger.info("rewriting repo-base url old=%s new=%s", value, rewritten)
             return rewritten
-        parsed = urlparse(value)
-        if parsed.scheme in {"http", "https"} and "/artifactory/api/ansible/" in value:
-            # Safety net if Artifactory returned a fully qualified ansible repo URL that does not exactly
-            # match repo.base_url formatting.
+
+        # Case 2: any absolute URL pointing to an Artifactory ansible repo path.
+        if parsed.scheme in {"http", "https"} and "/artifactory/api/ansible/" in parsed.path:
             marker = "/artifactory/api/ansible/"
-            idx = value.find(marker)
-            if idx >= 0:
-                tail = value[idx + len(marker):]
-                slash_idx = tail.find("/")
-                if slash_idx >= 0:
-                    rewritten = proxy_base + "/" + tail[slash_idx + 1 :].lstrip("/")
-                    logger.info("rewriting generic ansible repo url old=%s new=%s", value, rewritten)
-                    return rewritten
+            tail = parsed.path.split(marker, 1)[1]
+            slash_idx = tail.find("/")
+            if slash_idx >= 0:
+                rewritten_path = "/" + tail[slash_idx + 1 :].lstrip("/")
+                rewritten = proxy_base + rewritten_path
+                if parsed.query:
+                    rewritten += f"?{parsed.query}"
+                logger.info("rewriting artifactory ansible url old=%s new=%s", value, rewritten)
+                return rewritten
+
+        # Case 3: direct absolute artifact URL without the exact repo base match.
+        if parsed.scheme in {"http", "https"} and "/api/v3/plugin/ansible/content/published/collections/artifacts/" in parsed.path:
+            rewritten = proxy_base + parsed.path
+            if parsed.query:
+                rewritten += f"?{parsed.query}"
+            logger.info("rewriting direct artifact url old=%s new=%s", value, rewritten)
+            return rewritten
+
         return value
     return value
 

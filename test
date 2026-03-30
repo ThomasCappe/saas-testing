@@ -31,6 +31,7 @@ class RepoConfig:
     verify_tls: bool = True
     timeout_seconds: int = DEFAULT_TIMEOUT
     priority: int = 100
+    strip_api_prefix: bool = False
 
 
 @dataclass
@@ -59,11 +60,10 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
 
 
 CONFIG = load_config()
-app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="4.0.0")
+app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="5.0.0")
 
 
 NAMESPACE_PATTERNS = [
-    # Must come first, otherwise "artifacts" could be seen as namespace
     re.compile(r"/collections/artifacts/(?P<namespace>[^-]+)-[^/]+\.tar\.gz$"),
     re.compile(r"/collections/index/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
     re.compile(r"/collections/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
@@ -115,9 +115,7 @@ def unique_repo_names(names: List[str]) -> List[str]:
 
 def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
     ordered = ordered_repos()
-    ordered_names = [repo.name for repo in ordered]
 
-    # 1) Internal namespace explicitly mapped -> mapped repo first, then all others by priority
     if namespace and namespace in CONFIG.namespace_to_repo:
         mapped_repo_name = CONFIG.namespace_to_repo[namespace]
         mapped_repo = CONFIG.repos.get(mapped_repo_name)
@@ -134,7 +132,6 @@ def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
         )
         return candidates
 
-    # 2) Non-internal namespace -> try generic Hub repos first, then remaining repos by priority
     if namespace and namespace not in CONFIG.internal_namespaces:
         preferred_names = unique_repo_names(CONFIG.external_repo_candidates)
         preferred = [CONFIG.repos[name] for name in preferred_names if name in CONFIG.repos]
@@ -147,20 +144,28 @@ def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
         )
         return candidates
 
-    # 3) Namespace missing -> try everything by priority
     logger.warning(
         "namespace missing or ambiguous namespace=%s trying all repos by priority=%s",
         namespace,
-        ordered_names,
+        [repo.name for repo in ordered],
     )
     return ordered
 
 
 def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
+    upstream_path = path
+
+    # For Hub-like repos, remove leading /api because base_url already points to the Hub API entrypoint.
+    if repo.strip_api_prefix and upstream_path.startswith("/api/"):
+        upstream_path = upstream_path[len("/api/"):]
+        upstream_path = "/" + upstream_path.lstrip("/")
+
     base = repo.base_url.rstrip("/") + "/"
-    upstream = urljoin(base, path.lstrip("/"))
+    upstream = urljoin(base, upstream_path.lstrip("/"))
+
     if query_string:
         upstream = f"{upstream}?{query_string.decode()}"
+
     return upstream
 
 
@@ -184,7 +189,6 @@ def build_upstream_headers(request: Request, repo: RepoConfig) -> Dict[str, str]
         if key.lower() not in hop_by_hop_headers:
             headers[key] = value
 
-    # Only token from config file
     if repo.token:
         headers["Authorization"] = f"Bearer {repo.token}"
         logger.info("using configured repo token only repo=%s", repo.name)
@@ -251,20 +255,14 @@ def rewrite_json_urls(value, repo: RepoConfig, proxy_base: str):
 @app.get("/api")
 @app.get("/api/")
 async def api_root_discovery() -> Dict[str, object]:
-    return {
-        "available_versions": {
-            "v3": "v3/"
-        }
-    }
+    return {"available_versions": {"v3": "v3/"}}
 
 
 @app.get("/api/v3")
 @app.get("/api/v3/")
 async def api_v3_root() -> Dict[str, object]:
     return {
-        "available_versions": {
-            "v3": "/api/v3/"
-        },
+        "available_versions": {"v3": "/api/v3/"},
         "server_version": app.version,
     }
 
@@ -283,6 +281,7 @@ async def debug_config() -> Dict[str, object]:
                 "verify_tls": repo.verify_tls,
                 "timeout_seconds": repo.timeout_seconds,
                 "priority": repo.priority,
+                "strip_api_prefix": repo.strip_api_prefix,
                 "has_token": bool(repo.token),
             }
             for name, repo in CONFIG.repos.items()
@@ -354,7 +353,6 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
         last_response = upstream_response
         last_repo = repo
 
-        # fallback only on 404
         if upstream_response.status_code != 404:
             break
 

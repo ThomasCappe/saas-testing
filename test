@@ -31,10 +31,12 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import yaml
+import json
+
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import Response as FastAPIResponse
 
@@ -92,6 +94,58 @@ NAMESPACE_PATTERNS = [
     # /api/v3/plugin/ansible/content/published/collections/artifacts/<namespace>-<name>-<version>.tar.gz
     re.compile(r"/collections/artifacts/(?P<namespace>[^-/]+)-(?P<name>[^/]+)-[^/]+\.tar\.gz$"),
 ]
+
+
+def get_proxy_external_base(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
+def rewrite_json_urls(value, repo: RepoConfig, proxy_base: str):
+    if isinstance(value, dict):
+        return {k: rewrite_json_urls(v, repo, proxy_base) for k, v in value.items()}
+    if isinstance(value, list):
+        return [rewrite_json_urls(v, repo, proxy_base) for v in value]
+    if isinstance(value, str):
+        if value.startswith(repo.base_url):
+            rewritten = proxy_base + value[len(repo.base_url):]
+            logger.info("rewriting absolute url old=%s new=%s", value, rewritten)
+            return rewritten
+        parsed = urlparse(value)
+        if parsed.scheme in {"http", "https"} and "/artifactory/api/ansible/" in value:
+            # Safety net if Artifactory returned a fully qualified ansible repo URL that does not exactly
+            # match repo.base_url formatting.
+            marker = "/artifactory/api/ansible/"
+            idx = value.find(marker)
+            if idx >= 0:
+                tail = value[idx + len(marker):]
+                slash_idx = tail.find("/")
+                if slash_idx >= 0:
+                    rewritten = proxy_base + "/" + tail[slash_idx + 1 :].lstrip("/")
+                    logger.info("rewriting generic ansible repo url old=%s new=%s", value, rewritten)
+                    return rewritten
+        return value
+    return value
+
+
+@app.get("/api")
+@app.get("/api/")
+async def api_root_discovery() -> Dict[str, object]:
+    return {
+        "available_versions": {
+            "v3": "v3/"
+        }
+    }
+
+
+@app.get("/api/v3")
+@app.get("/api/v3/")
+async def api_v3_root() -> Dict[str, object]:
+    return {
+        "available_versions": {
+            "v3": "/api/v3/"
+        },
+        "server_version": app.version,
+    }
 
 
 @app.get("/healthz")
@@ -228,6 +282,14 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
                 path,
                 upstream_response.headers.get("content-type"),
             )
+            if upstream_response.status_code >= 400:
+                logger.error(
+                    "upstream error status=%s repo=%s path=%s body_preview=%s",
+                    upstream_response.status_code,
+                    repo.name,
+                    path,
+                    upstream_response.text[:800],
+                )
     except httpx.RequestError as exc:
         logger.exception("upstream request error repo=%s path=%s upstream=%s", repo.name, path, upstream_url)
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
@@ -235,8 +297,25 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
     response_headers = {
         key: value
         for key, value in upstream_response.headers.items()
-        if key.lower() not in {"content-encoding", "transfer-encoding", "connection"}
+        if key.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
     }
+
+    content_type = upstream_response.headers.get("content-type", "")
+    proxy_base = get_proxy_external_base(request)
+
+    if "application/json" in content_type:
+        try:
+            payload = upstream_response.json()
+            rewritten_payload = rewrite_json_urls(payload, repo, proxy_base)
+            logger.info("json response rewritten repo=%s path=%s proxy_base=%s", repo.name, path, proxy_base)
+            return FastAPIResponse(
+                content=json.dumps(rewritten_payload).encode("utf-8"),
+                status_code=upstream_response.status_code,
+                headers=response_headers,
+                media_type="application/json",
+            )
+        except Exception:
+            logger.exception("failed to rewrite json response repo=%s path=%s", repo.name, path)
 
     return FastAPIResponse(
         content=upstream_response.content,

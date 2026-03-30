@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Set
 from urllib.parse import urljoin, urlparse
@@ -60,14 +59,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
 
 
 CONFIG = load_config()
-app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="5.0.0")
-
-
-NAMESPACE_PATTERNS = [
-    re.compile(r"/collections/artifacts/(?P<namespace>[^-]+)-[^/]+\.tar\.gz$"),
-    re.compile(r"/collections/index/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
-    re.compile(r"/collections/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
-]
+app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="6.0.0")
 
 
 def get_proxy_external_base(request: Request) -> str:
@@ -75,16 +67,26 @@ def get_proxy_external_base(request: Request) -> str:
 
 
 def extract_namespace(path: str) -> Optional[str]:
-    for pattern in NAMESPACE_PATTERNS:
-        match = pattern.search(path)
-        if match:
-            namespace = match.group("namespace")
-            logger.info("namespace extracted path=%s namespace=%s pattern=%s", path, namespace, pattern.pattern)
+    logger.info("raw incoming path for namespace extraction=%s", path)
+
+    # 1) Galaxy NG / Automation Hub "index" endpoint
+    marker = "/collections/index/"
+    if marker in path:
+        tail = path.split(marker, 1)[1].strip("/")
+        parts = tail.split("/")
+        if len(parts) >= 2:
+            namespace = parts[0]
+            logger.info(
+                "namespace extracted from collections index path=%s namespace=%s",
+                path,
+                namespace,
+            )
             return namespace
 
-    artifact_marker = "/collections/artifacts/"
-    if artifact_marker in path:
-        filename = path.split(artifact_marker, 1)[1].split("/", 1)[0]
+    # 2) Artifact download endpoint
+    marker = "/collections/artifacts/"
+    if marker in path:
+        filename = path.split(marker, 1)[1].split("/", 1)[0]
         if filename.endswith(".tar.gz") and "-" in filename:
             namespace = filename.split("-", 1)[0]
             logger.info(
@@ -92,6 +94,20 @@ def extract_namespace(path: str) -> Optional[str]:
                 path,
                 namespace,
                 filename,
+            )
+            return namespace
+
+    # 3) Generic collections endpoint
+    marker = "/collections/"
+    if marker in path:
+        tail = path.split(marker, 1)[1].strip("/")
+        parts = tail.split("/")
+        if len(parts) >= 2 and parts[0] not in {"artifacts", "index"}:
+            namespace = parts[0]
+            logger.info(
+                "namespace extracted from generic collections path=%s namespace=%s",
+                path,
+                namespace,
             )
             return namespace
 
@@ -116,6 +132,7 @@ def unique_repo_names(names: List[str]) -> List[str]:
 def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
     ordered = ordered_repos()
 
+    # Internal namespace explicitly mapped
     if namespace and namespace in CONFIG.namespace_to_repo:
         mapped_repo_name = CONFIG.namespace_to_repo[namespace]
         mapped_repo = CONFIG.repos.get(mapped_repo_name)
@@ -132,6 +149,7 @@ def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
         )
         return candidates
 
+    # Any non-internal namespace goes to Hub repos first
     if namespace and namespace not in CONFIG.internal_namespaces:
         preferred_names = unique_repo_names(CONFIG.external_repo_candidates)
         preferred = [CONFIG.repos[name] for name in preferred_names if name in CONFIG.repos]
@@ -144,6 +162,7 @@ def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
         )
         return candidates
 
+    # Namespace missing / ambiguous -> try everything by priority
     logger.warning(
         "namespace missing or ambiguous namespace=%s trying all repos by priority=%s",
         namespace,
@@ -155,7 +174,7 @@ def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
 def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
     upstream_path = path
 
-    # For Hub-like repos, remove leading /api because base_url already points to the Hub API entrypoint.
+    # For Hub-like repos, remove leading /api because base_url already contains Hub API entrypoint
     if repo.strip_api_prefix and upstream_path.startswith("/api/"):
         upstream_path = upstream_path[len("/api/"):]
         upstream_path = "/" + upstream_path.lstrip("/")
@@ -189,6 +208,7 @@ def build_upstream_headers(request: Request, repo: RepoConfig) -> Dict[str, str]
         if key.lower() not in hop_by_hop_headers:
             headers[key] = value
 
+    # Use only token from config
     if repo.token:
         headers["Authorization"] = f"Bearer {repo.token}"
         logger.info("using configured repo token only repo=%s", repo.name)
@@ -353,6 +373,7 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
         last_response = upstream_response
         last_repo = repo
 
+        # fallback only on 404
         if upstream_response.status_code != 404:
             break
 

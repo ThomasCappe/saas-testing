@@ -1,49 +1,23 @@
 #!/usr/bin/env python3
-"""
-Simple reverse proxy between ansible-galaxy and multiple Artifactory Ansible repos.
-
-Principle
----------
-- ansible-galaxy keeps sending its normal paths unchanged
-- the proxy does NOT rebuild Galaxy responses
-- the proxy only chooses the target Artifactory repo based on the namespace
-- then it forwards the original request as-is to the selected repo
-
-Typical use case
-----------------
-One single URL for clients, multiple backend repos such as:
-- internal-ansible-dev
-- internal-ansible-prod
-- internal-ansible-shared
-
-Routing rule
-------------
-- if namespace == devops      -> internal-ansible-dev
-- if namespace == banking     -> internal-ansible-prod
-- if namespace == shared      -> internal-ansible-shared
-
-The proxy keeps the same request path and query string, and only swaps the repo base URL.
-"""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Set
 from urllib.parse import urljoin, urlparse
 
 import httpx
 import yaml
-import json
-
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import Response as FastAPIResponse
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("galaxy-artifactory-namespace-proxy")
+logger = logging.getLogger("galaxy-multi-repo-proxy")
 
 DEFAULT_CONFIG_PATH = os.getenv("PROXY_CONFIG", "/etc/ansible-galaxy-proxy.yaml")
 DEFAULT_TIMEOUT = int(os.getenv("PROXY_TIMEOUT_SECONDS", "60"))
@@ -56,19 +30,20 @@ class RepoConfig:
     token: Optional[str] = None
     verify_tls: bool = True
     timeout_seconds: int = DEFAULT_TIMEOUT
+    priority: int = 100
 
 
 @dataclass
 class ProxyConfig:
     repos: Dict[str, RepoConfig] = field(default_factory=dict)
     namespace_to_repo: Dict[str, str] = field(default_factory=dict)
-    default_repo: Optional[str] = None
-
+    internal_namespaces: Set[str] = field(default_factory=set)
+    external_repo_candidates: List[str] = field(default_factory=list)
 
 
 def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
     with open(path, "r", encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh)
+        raw = yaml.safe_load(fh) or {}
 
     repos: Dict[str, RepoConfig] = {}
     for item in raw.get("repos", []):
@@ -78,33 +53,145 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
     return ProxyConfig(
         repos=repos,
         namespace_to_repo=raw.get("namespace_to_repo", {}),
-        default_repo=raw.get("default_repo"),
+        internal_namespaces=set(raw.get("internal_namespaces", [])),
+        external_repo_candidates=raw.get("external_repo_candidates", []),
     )
 
 
 CONFIG = load_config()
-app = FastAPI(title="Simple Ansible Galaxy -> Artifactory namespace proxy", version="2.0.0")
+app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="4.0.0")
 
 
 NAMESPACE_PATTERNS = [
-    # /api/v3/plugin/ansible/content/published/collections/artifacts/<namespace>-<name>-<version>.tar.gz
-    # Must come first, otherwise the generic /collections/<namespace>/<name>/... pattern may wrongly
-    # interpret 'artifacts' as the namespace.
+    # Must come first, otherwise "artifacts" could be seen as namespace
     re.compile(r"/collections/artifacts/(?P<namespace>[^-]+)-[^/]+\.tar\.gz$"),
-    # /api/v3/plugin/ansible/content/published/collections/index/<namespace>/<name>/...
     re.compile(r"/collections/index/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
-    # /api/v3/collections/<namespace>/<name>/... or similar generic collection paths
     re.compile(r"/collections/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
-]+)/(?P<name>[^/]+)(?:/.*)?$"),
-    # /v3/collections/<namespace>/<name>/...
-    re.compile(r"/collections/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
-    # /api/v3/plugin/ansible/content/published/collections/artifacts/<namespace>-<name>-<version>.tar.gz
-    re.compile(r"/collections/artifacts/(?P<namespace>[^-/]+)-(?P<name>[^/]+)-[^/]+\.tar\.gz$"),
 ]
 
 
 def get_proxy_external_base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
+
+
+def extract_namespace(path: str) -> Optional[str]:
+    for pattern in NAMESPACE_PATTERNS:
+        match = pattern.search(path)
+        if match:
+            namespace = match.group("namespace")
+            logger.info("namespace extracted path=%s namespace=%s pattern=%s", path, namespace, pattern.pattern)
+            return namespace
+
+    artifact_marker = "/collections/artifacts/"
+    if artifact_marker in path:
+        filename = path.split(artifact_marker, 1)[1].split("/", 1)[0]
+        if filename.endswith(".tar.gz") and "-" in filename:
+            namespace = filename.split("-", 1)[0]
+            logger.info(
+                "namespace extracted from artifact filename path=%s namespace=%s filename=%s",
+                path,
+                namespace,
+                filename,
+            )
+            return namespace
+
+    logger.warning("namespace not extracted path=%s", path)
+    return None
+
+
+def ordered_repos() -> List[RepoConfig]:
+    return sorted(CONFIG.repos.values(), key=lambda r: r.priority)
+
+
+def unique_repo_names(names: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
+def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
+    ordered = ordered_repos()
+    ordered_names = [repo.name for repo in ordered]
+
+    # 1) Internal namespace explicitly mapped -> mapped repo first, then all others by priority
+    if namespace and namespace in CONFIG.namespace_to_repo:
+        mapped_repo_name = CONFIG.namespace_to_repo[namespace]
+        mapped_repo = CONFIG.repos.get(mapped_repo_name)
+        if not mapped_repo:
+            logger.error("configured repo missing namespace=%s repo_name=%s", namespace, mapped_repo_name)
+            raise HTTPException(status_code=500, detail=f"Configured repo not found: {mapped_repo_name}")
+
+        remaining = [repo for repo in ordered if repo.name != mapped_repo.name]
+        candidates = [mapped_repo] + remaining
+        logger.info(
+            "candidate repos for mapped internal namespace namespace=%s repos=%s",
+            namespace,
+            [repo.name for repo in candidates],
+        )
+        return candidates
+
+    # 2) Non-internal namespace -> try generic Hub repos first, then remaining repos by priority
+    if namespace and namespace not in CONFIG.internal_namespaces:
+        preferred_names = unique_repo_names(CONFIG.external_repo_candidates)
+        preferred = [CONFIG.repos[name] for name in preferred_names if name in CONFIG.repos]
+        remaining = [repo for repo in ordered if repo.name not in preferred_names]
+        candidates = preferred + remaining
+        logger.info(
+            "candidate repos for non-internal namespace namespace=%s repos=%s",
+            namespace,
+            [repo.name for repo in candidates],
+        )
+        return candidates
+
+    # 3) Namespace missing -> try everything by priority
+    logger.warning(
+        "namespace missing or ambiguous namespace=%s trying all repos by priority=%s",
+        namespace,
+        ordered_names,
+    )
+    return ordered
+
+
+def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
+    base = repo.base_url.rstrip("/") + "/"
+    upstream = urljoin(base, path.lstrip("/"))
+    if query_string:
+        upstream = f"{upstream}?{query_string.decode()}"
+    return upstream
+
+
+def build_upstream_headers(request: Request, repo: RepoConfig) -> Dict[str, str]:
+    hop_by_hop_headers = {
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "authorization",
+    }
+
+    headers: Dict[str, str] = {}
+    for key, value in request.headers.items():
+        if key.lower() not in hop_by_hop_headers:
+            headers[key] = value
+
+    # Only token from config file
+    if repo.token:
+        headers["Authorization"] = f"Bearer {repo.token}"
+        logger.info("using configured repo token only repo=%s", repo.name)
+    else:
+        logger.warning("no configured repo token repo=%s", repo.name)
+
+    return headers
 
 
 def rewrite_single_url(value: str, repo: RepoConfig, proxy_base: str) -> str:
@@ -120,7 +207,7 @@ def rewrite_single_url(value: str, repo: RepoConfig, proxy_base: str) -> str:
         tail = parsed.path.split(marker, 1)[1]
         slash_idx = tail.find("/")
         if slash_idx >= 0:
-            rewritten_path = "/" + tail[slash_idx + 1 :].lstrip("/")
+            rewritten_path = "/" + tail[slash_idx + 1:].lstrip("/")
             rewritten = proxy_base + rewritten_path
             if parsed.query:
                 rewritten += f"?{parsed.query}"
@@ -195,103 +282,15 @@ async def debug_config() -> Dict[str, object]:
                 "base_url": repo.base_url,
                 "verify_tls": repo.verify_tls,
                 "timeout_seconds": repo.timeout_seconds,
+                "priority": repo.priority,
                 "has_token": bool(repo.token),
             }
             for name, repo in CONFIG.repos.items()
         },
         "namespace_to_repo": CONFIG.namespace_to_repo,
-        "default_repo": CONFIG.default_repo,
+        "internal_namespaces": sorted(CONFIG.internal_namespaces),
+        "external_repo_candidates": CONFIG.external_repo_candidates,
     }
-
-
-
-def extract_namespace(path: str) -> Optional[str]:
-    for pattern in NAMESPACE_PATTERNS:
-        match = pattern.search(path)
-        if match:
-            namespace = match.group("namespace")
-            logger.info("namespace extracted path=%s namespace=%s pattern=%s", path, namespace, pattern.pattern)
-            return namespace
-
-    # Extra fallback for artifact downloads: use the tar.gz filename and keep the part before the first '-'.
-    artifact_marker = "/collections/artifacts/"
-    if artifact_marker in path:
-        filename = path.split(artifact_marker, 1)[1].split("/", 1)[0]
-        if filename.endswith(".tar.gz") and "-" in filename:
-            namespace = filename.split("-", 1)[0]
-            logger.info("namespace extracted from artifact filename path=%s namespace=%s filename=%s", path, namespace, filename)
-            return namespace
-
-    logger.warning("namespace not extracted path=%s", path)
-    return None
-
-
-
-def get_repo_for_namespace(namespace: Optional[str]) -> RepoConfig:
-    if namespace and namespace in CONFIG.namespace_to_repo:
-        repo_name = CONFIG.namespace_to_repo[namespace]
-        repo = CONFIG.repos.get(repo_name)
-        if not repo:
-            logger.error("configured repo missing namespace=%s repo_name=%s", namespace, repo_name)
-            raise HTTPException(status_code=500, detail=f"Configured repo not found: {repo_name}")
-        logger.info("namespace mapped namespace=%s repo=%s", namespace, repo.name)
-        return repo
-
-    # If the namespace is not internal / not explicitly mapped, use the default repo.
-    if CONFIG.default_repo:
-        repo = CONFIG.repos.get(CONFIG.default_repo)
-        if not repo:
-            logger.error("default repo missing default_repo=%s", CONFIG.default_repo)
-            raise HTTPException(status_code=500, detail=f"Default repo not found: {CONFIG.default_repo}")
-        logger.warning("namespace not mapped, using default_repo namespace=%s repo=%s", namespace, repo.name)
-        return repo
-
-    if namespace is not None:
-        logger.error("namespace extracted but not mapped namespace=%s", namespace)
-        raise HTTPException(status_code=404, detail=f"Namespace is not mapped: {namespace}")
-
-    logger.error("namespace not extracted and no default repo configured")
-    raise HTTPException(status_code=404, detail="No namespace extracted and no default repo configured")
-
-
-
-def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
-    base = repo.base_url.rstrip("/") + "/"
-    upstream = urljoin(base, path.lstrip("/"))
-    if query_string:
-        upstream = f"{upstream}?{query_string.decode()}"
-    return upstream
-
-
-
-def build_upstream_headers(request: Request, repo: RepoConfig, authorization: Optional[str]) -> Dict[str, str]:
-    hop_by_hop_headers = {
-        "host",
-        "content-length",
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "authorization",
-    }
-
-    headers: Dict[str, str] = {}
-    for key, value in request.headers.items():
-        if key.lower() not in hop_by_hop_headers:
-            headers[key] = value
-
-    # Always use the token from the config file for the selected repo.
-    if repo.token:
-        headers["Authorization"] = f"Bearer {repo.token}"
-        logger.info("using configured repo token only repo=%s", repo.name)
-    else:
-        logger.warning("no configured repo token repo=%s", repo.name)
-
-    return headers
 
 
 @app.api_route(
@@ -301,115 +300,95 @@ def build_upstream_headers(request: Request, repo: RepoConfig, authorization: Op
 async def proxy_all(full_path: str, request: Request, authorization: Optional[str] = Header(None)) -> Response:
     path = "/" + full_path
     namespace = extract_namespace(path)
-    repo = get_repo_for_namespace(namespace)
-    upstream_url = build_upstream_url(repo, path, request.scope.get("query_string", b""))
-    headers = build_upstream_headers(request, repo, authorization)
+    candidate_repos = get_candidate_repos(namespace)
     body = await request.body()
 
-    logger.info(
-        "incoming request method=%s namespace=%s repo=%s path=%s query=%s upstream=%s",
-        request.method,
-        namespace,
-        repo.name,
-        path,
-        request.scope.get("query_string", b"").decode(),
-        upstream_url,
-    )
+    last_response = None
+    last_repo = None
 
-    try:
-        async with httpx.AsyncClient(timeout=repo.timeout_seconds, verify=repo.verify_tls, follow_redirects=True) as client:
-            upstream_response = await client.request(
-                method=request.method,
-                url=upstream_url,
-                headers=headers,
-                content=body,
-            )
-            logger.info(
-                "upstream response status=%s repo=%s path=%s content_type=%s",
-                upstream_response.status_code,
-                repo.name,
-                path,
-                upstream_response.headers.get("content-type"),
-            )
-            if upstream_response.status_code >= 400:
-                logger.error(
-                    "upstream error status=%s repo=%s path=%s body_preview=%s",
+    for repo in candidate_repos:
+        upstream_url = build_upstream_url(repo, path, request.scope.get("query_string", b""))
+        headers = build_upstream_headers(request, repo)
+
+        logger.info(
+            "incoming request method=%s namespace=%s repo=%s path=%s query=%s upstream=%s",
+            request.method,
+            namespace,
+            repo.name,
+            path,
+            request.scope.get("query_string", b"").decode(),
+            upstream_url,
+        )
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=repo.timeout_seconds,
+                verify=repo.verify_tls,
+                follow_redirects=True,
+            ) as client:
+                upstream_response = await client.request(
+                    method=request.method,
+                    url=upstream_url,
+                    headers=headers,
+                    content=body,
+                )
+                logger.info(
+                    "upstream response status=%s repo=%s path=%s content_type=%s",
                     upstream_response.status_code,
                     repo.name,
                     path,
-                    upstream_response.text[:800],
+                    upstream_response.headers.get("content-type"),
                 )
-    except httpx.RequestError as exc:
-        logger.exception("upstream request error repo=%s path=%s upstream=%s", repo.name, path, upstream_url)
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
+                if upstream_response.status_code >= 400:
+                    logger.error(
+                        "upstream error status=%s repo=%s path=%s body_preview=%s",
+                        upstream_response.status_code,
+                        repo.name,
+                        path,
+                        upstream_response.text[:800],
+                    )
+        except httpx.RequestError:
+            logger.exception("upstream request error repo=%s path=%s upstream=%s", repo.name, path, upstream_url)
+            continue
+
+        last_response = upstream_response
+        last_repo = repo
+
+        # fallback only on 404
+        if upstream_response.status_code != 404:
+            break
+
+        logger.warning("repo returned 404, trying next repo repo=%s path=%s", repo.name, path)
+
+    if last_response is None or last_repo is None:
+        raise HTTPException(status_code=502, detail="All upstream repos failed to respond")
 
     response_headers = {
         key: value
-        for key, value in upstream_response.headers.items()
+        for key, value in last_response.headers.items()
         if key.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
     }
 
-    content_type = upstream_response.headers.get("content-type", "")
+    content_type = last_response.headers.get("content-type", "")
     proxy_base = get_proxy_external_base(request)
 
     if "application/json" in content_type:
         try:
-            payload = upstream_response.json()
-            rewritten_payload = rewrite_json_urls(payload, repo, proxy_base)
-            logger.info("json response rewritten repo=%s path=%s proxy_base=%s", repo.name, path, proxy_base)
+            payload = last_response.json()
+            rewritten_payload = rewrite_json_urls(payload, last_repo, proxy_base)
+            logger.info("json response rewritten repo=%s path=%s proxy_base=%s", last_repo.name, path, proxy_base)
             return FastAPIResponse(
                 content=json.dumps(rewritten_payload).encode("utf-8"),
-                status_code=upstream_response.status_code,
+                status_code=last_response.status_code,
                 headers=response_headers,
                 media_type="application/json",
             )
         except Exception:
-            logger.exception("failed to rewrite json response repo=%s path=%s", repo.name, path)
+            logger.exception("failed to rewrite json response repo=%s path=%s", last_repo.name, path)
 
     return FastAPIResponse(
-        content=upstream_response.content,
-        status_code=upstream_response.status_code,
+        content=last_response.content,
+        status_code=last_response.status_code,
         headers=response_headers,
-        media_type=upstream_response.headers.get("content-type"),
+        media_type=last_response.headers.get("content-type"),
     )
-
-
-# Example config file:
-# repos:
-#   - name: internal-dev
-#     base_url: "https://jfrog.example.com/artifactory/api/ansible/internal-ansible-dev"
-#     token: null
-#     verify_tls: true
-#     timeout_seconds: 60
-#
-#   - name: internal-prod
-#     base_url: "https://jfrog.example.com/artifactory/api/ansible/internal-ansible-prod"
-#     token: null
-#     verify_tls: true
-#     timeout_seconds: 60
-#
-#   - name: internal-shared
-#     base_url: "https://jfrog.example.com/artifactory/api/ansible/internal-ansible-shared"
-#     token: null
-#     verify_tls: true
-#     timeout_seconds: 60
-#
-# namespace_to_repo:
-#   devops: internal-dev
-#   sandbox: internal-dev
-#   banking: internal-prod
-#   core: internal-prod
-#   shared: internal-shared
-#
-# default_repo: internal-dev
-#
-# Run:
-#   PROXY_CONFIG=/etc/ansible-galaxy-proxy.yaml uvicorn ansible_galaxy_artifactory_proxy:app --host 0.0.0.0 --port 8080
-#
-# Example ansible.cfg:
-#   [galaxy]
-#   server_list = local_proxy
-#
-#   [galaxy_server.local_proxy]
-#   url = http://localhost:8080/api/
-#   token = <TOKEN>

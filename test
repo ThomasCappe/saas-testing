@@ -173,6 +173,7 @@ def build_upstream_headers(request: Request, repo: RepoConfig, authorization: Op
         "trailers",
         "transfer-encoding",
         "upgrade",
+        "authorization",
     }
 
     headers: Dict[str, str] = {}
@@ -180,15 +181,12 @@ def build_upstream_headers(request: Request, repo: RepoConfig, authorization: Op
         if key.lower() not in hop_by_hop_headers:
             headers[key] = value
 
-    # Preserve client Authorization if provided, otherwise fallback to repo token.
-    if authorization:
-        headers["Authorization"] = authorization
-        logger.info("using client authorization header repo=%s", repo.name)
-    elif repo.token:
+    # Always use the token from the config file for the selected repo.
+    if repo.token:
         headers["Authorization"] = f"Bearer {repo.token}"
-        logger.info("using configured repo token repo=%s", repo.name)
+        logger.info("using configured repo token only repo=%s", repo.name)
     else:
-        logger.warning("no authorization header and no configured repo token repo=%s", repo.name)
+        logger.warning("no configured repo token repo=%s", repo.name)
 
     return headers
 

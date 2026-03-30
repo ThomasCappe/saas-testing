@@ -87,8 +87,15 @@ app = FastAPI(title="Simple Ansible Galaxy -> Artifactory namespace proxy", vers
 
 
 NAMESPACE_PATTERNS = [
+    # /api/v3/plugin/ansible/content/published/collections/artifacts/<namespace>-<name>-<version>.tar.gz
+    # Must come first, otherwise the generic /collections/<namespace>/<name>/... pattern may wrongly
+    # interpret 'artifacts' as the namespace.
+    re.compile(r"/collections/artifacts/(?P<namespace>[^-]+)-[^/]+\.tar\.gz$"),
     # /api/v3/plugin/ansible/content/published/collections/index/<namespace>/<name>/...
     re.compile(r"/collections/index/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
+    # /api/v3/collections/<namespace>/<name>/... or similar generic collection paths
+    re.compile(r"/collections/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
+]+)/(?P<name>[^/]+)(?:/.*)?$"),
     # /v3/collections/<namespace>/<name>/...
     re.compile(r"/collections/(?P<namespace>[^/]+)/(?P<name>[^/]+)(?:/.*)?$"),
     # /api/v3/plugin/ansible/content/published/collections/artifacts/<namespace>-<name>-<version>.tar.gz
@@ -205,6 +212,16 @@ def extract_namespace(path: str) -> Optional[str]:
             namespace = match.group("namespace")
             logger.info("namespace extracted path=%s namespace=%s pattern=%s", path, namespace, pattern.pattern)
             return namespace
+
+    # Extra fallback for artifact downloads: use the tar.gz filename and keep the part before the first '-'.
+    artifact_marker = "/collections/artifacts/"
+    if artifact_marker in path:
+        filename = path.split(artifact_marker, 1)[1].split("/", 1)[0]
+        if filename.endswith(".tar.gz") and "-" in filename:
+            namespace = filename.split("-", 1)[0]
+            logger.info("namespace extracted from artifact filename path=%s namespace=%s filename=%s", path, namespace, filename)
+            return namespace
+
     logger.warning("namespace not extracted path=%s", path)
     return None
 

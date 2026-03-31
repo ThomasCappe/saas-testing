@@ -59,7 +59,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
 
 
 CONFIG = load_config()
-app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="9.0.0")
+app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="10.0.0")
 
 
 def get_proxy_external_base(request: Request) -> str:
@@ -67,48 +67,29 @@ def get_proxy_external_base(request: Request) -> str:
 
 
 def extract_namespace(path: str) -> Optional[str]:
-    logger.info("raw incoming path for namespace extraction=%s", path)
-
+    # 1) Galaxy NG / Automation Hub "index" endpoint
     marker = "/collections/index/"
     if marker in path:
         tail = path.split(marker, 1)[1].strip("/")
         parts = tail.split("/")
         if len(parts) >= 2:
-            namespace = parts[0]
-            logger.info(
-                "namespace extracted from collections index path=%s namespace=%s",
-                path,
-                namespace,
-            )
-            return namespace
+            return parts[0]
 
+    # 2) Artifact download endpoint
     marker = "/collections/artifacts/"
     if marker in path:
         filename = path.split(marker, 1)[1].split("/", 1)[0]
         if filename.endswith(".tar.gz") and "-" in filename:
-            namespace = filename.split("-", 1)[0]
-            logger.info(
-                "namespace extracted from artifact filename path=%s namespace=%s filename=%s",
-                path,
-                namespace,
-                filename,
-            )
-            return namespace
+            return filename.split("-", 1)[0]
 
+    # 3) Generic collections endpoint
     marker = "/collections/"
     if marker in path:
         tail = path.split(marker, 1)[1].strip("/")
         parts = tail.split("/")
         if len(parts) >= 2 and parts[0] not in {"artifacts", "index"}:
-            namespace = parts[0]
-            logger.info(
-                "namespace extracted from generic collections path=%s namespace=%s",
-                path,
-                namespace,
-            )
-            return namespace
+            return parts[0]
 
-    logger.warning("namespace not extracted path=%s", path)
     return None
 
 
@@ -133,35 +114,17 @@ def get_candidate_repos(namespace: Optional[str]) -> List[RepoConfig]:
         mapped_repo_name = CONFIG.namespace_to_repo[namespace]
         mapped_repo = CONFIG.repos.get(mapped_repo_name)
         if not mapped_repo:
-            logger.error("configured repo missing namespace=%s repo_name=%s", namespace, mapped_repo_name)
             raise HTTPException(status_code=500, detail=f"Configured repo not found: {mapped_repo_name}")
 
         remaining = [repo for repo in ordered if repo.name != mapped_repo.name]
-        candidates = [mapped_repo] + remaining
-        logger.info(
-            "candidate repos for mapped internal namespace namespace=%s repos=%s",
-            namespace,
-            [repo.name for repo in candidates],
-        )
-        return candidates
+        return [mapped_repo] + remaining
 
     if namespace and namespace not in CONFIG.internal_namespaces:
         preferred_names = unique_repo_names(CONFIG.external_repo_candidates)
         preferred = [CONFIG.repos[name] for name in preferred_names if name in CONFIG.repos]
         remaining = [repo for repo in ordered if repo.name not in preferred_names]
-        candidates = preferred + remaining
-        logger.info(
-            "candidate repos for non-internal namespace namespace=%s repos=%s",
-            namespace,
-            [repo.name for repo in candidates],
-        )
-        return candidates
+        return preferred + remaining
 
-    logger.warning(
-        "namespace missing or ambiguous namespace=%s trying all repos by priority=%s",
-        namespace,
-        [repo.name for repo in ordered],
-    )
     return ordered
 
 
@@ -173,10 +136,12 @@ def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
         base_parsed = urlparse(repo.base_url)
         base_path = base_parsed.path.rstrip("/")
 
+        # If incoming path already contains the Hub repo path, strip it
         if base_path and upstream_path.startswith(base_path + "/"):
             upstream_path = upstream_path[len(base_path):]
             upstream_path = "/" + upstream_path.lstrip("/")
 
+        # Otherwise strip only leading /api for Hub-like repos
         elif upstream_path.startswith("/api/"):
             upstream_path = upstream_path[len("/api/"):]
             upstream_path = "/" + upstream_path.lstrip("/")
@@ -211,9 +176,6 @@ def build_upstream_headers(request: Request, repo: RepoConfig) -> Dict[str, str]
 
     if repo.token:
         headers["Authorization"] = f"Bearer {repo.token}"
-        logger.info("using configured repo token only repo=%s", repo.name)
-    else:
-        logger.warning("no configured repo token repo=%s", repo.name)
 
     return headers
 
@@ -222,9 +184,7 @@ def rewrite_single_url(value: str, repo: RepoConfig, proxy_base: str) -> str:
     parsed = urlparse(value)
 
     if value.startswith(repo.base_url):
-        rewritten = proxy_base + value[len(repo.base_url):]
-        logger.info("rewriting repo-base url old=%s new=%s", value, rewritten)
-        return rewritten
+        return proxy_base + value[len(repo.base_url):]
 
     if parsed.scheme in {"http", "https"} and "/artifactory/api/ansible/" in parsed.path:
         marker = "/artifactory/api/ansible/"
@@ -235,14 +195,12 @@ def rewrite_single_url(value: str, repo: RepoConfig, proxy_base: str) -> str:
             rewritten = proxy_base + rewritten_path
             if parsed.query:
                 rewritten += f"?{parsed.query}"
-            logger.info("rewriting artifactory ansible url old=%s new=%s", value, rewritten)
             return rewritten
 
     if parsed.scheme in {"http", "https"} and "/api/v3/plugin/ansible/content/published/collections/artifacts/" in parsed.path:
         rewritten = proxy_base + parsed.path
         if parsed.query:
             rewritten += f"?{parsed.query}"
-        logger.info("rewriting direct artifact url old=%s new=%s", value, rewritten)
         return rewritten
 
     return value
@@ -255,10 +213,7 @@ def rewrite_json_urls(value, repo: RepoConfig, proxy_base: str):
         new_dict = {}
         for k, v in value.items():
             if k in special_url_keys and isinstance(v, str):
-                new_v = rewrite_single_url(v, repo, proxy_base)
-                if new_v != v:
-                    logger.info("rewriting json field key=%s old=%s new=%s", k, v, new_v)
-                new_dict[k] = new_v
+                new_dict[k] = rewrite_single_url(v, repo, proxy_base)
             else:
                 new_dict[k] = rewrite_json_urls(v, repo, proxy_base)
         return new_dict
@@ -333,15 +288,8 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
         upstream_url = build_upstream_url(repo, path, request.scope.get("query_string", b""))
         headers = build_upstream_headers(request, repo)
 
-        logger.info(
-            "incoming request method=%s namespace=%s repo=%s path=%s query=%s upstream=%s",
-            request.method,
-            namespace,
-            repo.name,
-            path,
-            request.scope.get("query_string", b"").decode(),
-            upstream_url,
-        )
+        logger.info("namespace=%s | received=%s", namespace, path)
+        logger.info("namespace=%s | repo=%s | sent=%s", namespace, repo.name, upstream_url)
 
         try:
             async with httpx.AsyncClient(
@@ -355,25 +303,27 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
                     headers=headers,
                     content=body,
                 )
-        except httpx.RequestError:
-            logger.exception("upstream request error repo=%s path=%s upstream=%s", repo.name, path, upstream_url)
+        except httpx.RequestError as exc:
+            logger.error("namespace=%s | repo=%s | sent=%s | result=request_error | error=%s", namespace, repo.name, upstream_url, exc)
             continue
 
         logger.info(
-            "upstream response status=%s repo=%s path=%s content_type=%s",
-            upstream_response.status_code,
+            "namespace=%s | repo=%s | received=%s | sent=%s | result=%s",
+            namespace,
             repo.name,
             path,
-            upstream_response.headers.get("content-type"),
+            upstream_url,
+            upstream_response.status_code,
         )
 
         if upstream_response.status_code >= 400:
             logger.error(
-                "upstream error status=%s repo=%s path=%s body_preview=%s",
-                upstream_response.status_code,
+                "namespace=%s | repo=%s | sent=%s | result=%s | body=%s",
+                namespace,
                 repo.name,
-                path,
-                upstream_response.text[:800],
+                upstream_url,
+                upstream_response.status_code,
+                upstream_response.text[:300],
             )
 
         last_response = upstream_response
@@ -382,24 +332,11 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
         if 200 <= upstream_response.status_code < 400:
             successful_response = upstream_response
             successful_repo = repo
-            logger.info("successful upstream response repo=%s status=%s", repo.name, upstream_response.status_code)
             break
 
         if upstream_response.status_code in retryable_statuses:
-            logger.warning(
-                "repo returned retryable status=%s, trying next repo repo=%s path=%s",
-                upstream_response.status_code,
-                repo.name,
-                path,
-            )
             continue
 
-        logger.error(
-            "repo returned non-retryable status=%s, stopping repo=%s path=%s",
-            upstream_response.status_code,
-            repo.name,
-            path,
-        )
         break
 
     final_response = successful_response or last_response
@@ -421,7 +358,6 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
         try:
             payload = final_response.json()
             rewritten_payload = rewrite_json_urls(payload, final_repo, proxy_base)
-            logger.info("json response rewritten repo=%s path=%s proxy_base=%s", final_repo.name, path, proxy_base)
             return FastAPIResponse(
                 content=json.dumps(rewritten_payload).encode("utf-8"),
                 status_code=final_response.status_code,
@@ -429,7 +365,7 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
                 media_type="application/json",
             )
         except Exception:
-            logger.exception("failed to rewrite json response repo=%s path=%s", final_repo.name, path)
+            logger.error("namespace=%s | repo=%s | result=json_rewrite_error", namespace, final_repo.name)
 
     return FastAPIResponse(
         content=final_response.content,

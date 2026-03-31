@@ -59,7 +59,7 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> ProxyConfig:
 
 
 CONFIG = load_config()
-app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="10.0.0")
+app = FastAPI(title="Ansible Galaxy Multi Repo Proxy", version="11.0.0")
 
 
 def get_proxy_external_base(request: Request) -> str:
@@ -136,12 +136,10 @@ def build_upstream_url(repo: RepoConfig, path: str, query_string: bytes) -> str:
         base_parsed = urlparse(repo.base_url)
         base_path = base_parsed.path.rstrip("/")
 
-        # If incoming path already contains the Hub repo path, strip it
         if base_path and upstream_path.startswith(base_path + "/"):
             upstream_path = upstream_path[len(base_path):]
             upstream_path = "/" + upstream_path.lstrip("/")
 
-        # Otherwise strip only leading /api for Hub-like repos
         elif upstream_path.startswith("/api/"):
             upstream_path = upstream_path[len("/api/"):]
             upstream_path = "/" + upstream_path.lstrip("/")
@@ -227,6 +225,28 @@ def rewrite_json_urls(value, repo: RepoConfig, proxy_base: str):
     return value
 
 
+def is_empty_json_result(response: httpx.Response) -> bool:
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return False
+
+    try:
+        payload = response.json()
+    except Exception:
+        return False
+
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list) and len(data) == 0:
+            return True
+
+        meta = payload.get("meta")
+        if isinstance(meta, dict) and meta.get("count") == 0:
+            return True
+
+    return False
+
+
 @app.get("/api")
 @app.get("/api/")
 async def api_root_discovery() -> Dict[str, object]:
@@ -304,7 +324,13 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
                     content=body,
                 )
         except httpx.RequestError as exc:
-            logger.error("namespace=%s | repo=%s | sent=%s | result=request_error | error=%s", namespace, repo.name, upstream_url, exc)
+            logger.error(
+                "namespace=%s | repo=%s | sent=%s | result=request_error | error=%s",
+                namespace,
+                repo.name,
+                upstream_url,
+                exc,
+            )
             continue
 
         logger.info(
@@ -330,6 +356,15 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
         last_repo = repo
 
         if 200 <= upstream_response.status_code < 400:
+            if is_empty_json_result(upstream_response):
+                logger.warning(
+                    "namespace=%s | repo=%s | sent=%s | result=empty_json | trying_next_repo=true",
+                    namespace,
+                    repo.name,
+                    upstream_url,
+                )
+                continue
+
             successful_response = upstream_response
             successful_repo = repo
             break
@@ -365,7 +400,11 @@ async def proxy_all(full_path: str, request: Request, authorization: Optional[st
                 media_type="application/json",
             )
         except Exception:
-            logger.error("namespace=%s | repo=%s | result=json_rewrite_error", namespace, final_repo.name)
+            logger.error(
+                "namespace=%s | repo=%s | result=json_rewrite_error",
+                namespace,
+                final_repo.name,
+            )
 
     return FastAPIResponse(
         content=final_response.content,

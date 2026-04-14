@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-read -rp "URL Artifactory (ex: https://mon-artifactory.example.com/artifactory) : " ART_URL
-read -rp "Repo source REMOTE : " SRC_REMOTE
-read -rp "Repo cible LOCAL : " DST_LOCAL
+# =========================
+# CONFIG A MODIFIER ICI
+# =========================
+ART_URL="https://mon-artifactory.example.com/artifactory"
+SRC_REMOTE="ansible-remote"
+DST_LOCAL="ansible-local"
+# =========================
+
 read -rp "Collection (ex: community.general) : " COLLECTION
 read -rp "Version (ex: 1.0.0) : " VERSION
 read -rsp "Token : " TOKEN
@@ -21,7 +26,7 @@ url=$ART_URL/api/ansible/$SRC_REMOTE
 token=$TOKEN
 EOF
 
-echo "Téléchargement depuis le remote..."
+echo "Téléchargement depuis le remote $SRC_REMOTE ..."
 (
   cd "$TMP_DIR"
   ANSIBLE_CONFIG="$TMP_DIR/ansible.cfg" \
@@ -36,7 +41,7 @@ if [[ -z "${ARCHIVE:-}" ]]; then
 fi
 
 echo "Archive téléchargée : $ARCHIVE"
-echo "Publication dans le local..."
+echo "Publication dans le local $DST_LOCAL ..."
 
 ansible-galaxy collection publish "$ARCHIVE" \
   -s "$ART_URL/api/ansible/$DST_LOCAL" \

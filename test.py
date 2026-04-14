@@ -17,10 +17,8 @@ def ask_input(label, default=None, secret=False):
     if default is not None:
         prompt += f" [{default}]"
     prompt += " : "
-
     value = getpass(prompt) if secret else input(prompt)
     value = value.strip()
-
     if not value and default is not None:
         return default
     return value
@@ -35,7 +33,6 @@ def api_post(url, token, body=b"", content_type=None):
         headers["Content-Type"] = content_type
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-
     try:
         with urllib.request.urlopen(req) as resp:
             return resp.getcode(), resp.read().decode("utf-8", errors="replace")
@@ -44,13 +41,13 @@ def api_post(url, token, body=b"", content_type=None):
 
 
 def main():
-    print("=== Déplacement d'une archive Ansible Artifactory ===\n")
+    print("=== Copie d'une archive Ansible depuis un remote vers un local ===\n")
 
     art_url = ask_input("URL Artifactory", "https://mon-artifactory.example.com/artifactory").rstrip("/")
-    src_repo = ask_input("Repo source (laisser vide pour recherche automatique)")
-    dst_repo = ask_input("Repo cible", "internal-ansible-prod")
+    src_repo = ask_input("Repo source REMOTE")
+    dst_repo = ask_input("Repo cible LOCAL")
     token = ask_input("Token", secret=True)
-    raw = ask_input("Archive à déplacer (format namespace.collection:version)", "Community.general:1.0.0")
+    raw = ask_input("Archive à copier (format namespace.collection:version)", "Community.general:1.0.0")
 
     if not token:
         fail("token vide")
@@ -67,13 +64,8 @@ def main():
 
     archive_name = f"{collection.replace('.', '-')}-{version}.tar.gz"
 
-    if src_repo:
-        aql = f'''items.find({{
+    aql = f'''items.find({{
   "repo": "{src_repo}",
-  "name": "{archive_name}"
-}}).include("repo","path","name")'''
-    else:
-        aql = f'''items.find({{
   "name": "{archive_name}"
 }}).include("repo","path","name")'''
 
@@ -87,59 +79,42 @@ def main():
     results = data.get("results", [])
 
     if not results:
-        fail(f"archive introuvable: {archive_name}")
-
-    # On évite de tester le repo cible comme source
-    candidates = [r for r in results if r["repo"] != dst_repo]
-
-    if not candidates:
-        fail("aucune source exploitable trouvée")
-
-    print("\nCandidats trouvés :")
-    for item in candidates:
-        p = item["name"] if item["path"] == "." else f"{item['path']}/{item['name']}"
-        print(f" - {item['repo']}/{p}")
-
-    errors = []
-
-    for item in candidates:
-        repo = item["repo"]
-        path = item["path"]
-        name = item["name"]
-
-        relative_path = name if path == "." else f"{path}/{name}"
-
-        encoded_src = urllib.parse.quote(relative_path, safe="/")
-        encoded_to = urllib.parse.quote(f"/{dst_repo}/{relative_path}", safe="")
-
-        move_url = (
-            f"{art_url}/api/move/{repo}/{encoded_src}"
-            f"?to={encoded_to}&suppressLayouts=1"
+        fail(
+            f"archive introuvable dans {src_repo}: {archive_name}\n"
+            f"Si le repo est remote, il faut peut-être d'abord résoudre/télécharger l'archive une fois pour la mettre en cache."
         )
 
-        print(f"\nTest move depuis {repo} ...")
-        code, body = api_post(move_url, token, body=b"")
+    if len(results) > 1:
+        print("\nPlusieurs résultats trouvés :", file=sys.stderr)
+        for item in results:
+            p = item["name"] if item["path"] == "." else f"{item['path']}/{item['name']}"
+            print(f" - {item['repo']}/{p}", file=sys.stderr)
+        fail("recherche ambiguë")
 
-        if code == 200:
-            print("\nDéplacement OK")
-            print(f"Source      : {repo}/{relative_path}")
-            print(f"Destination : {dst_repo}/{relative_path}")
-            print(body)
-            return
+    item = results[0]
+    path = item["path"]
+    name = item["name"]
 
-        lowered = body.lower()
-        if "not a local repository" in lowered or "repository is not a local repository" in lowered:
-            print(f" -> {repo} ignoré : pas un repo local")
-            continue
+    relative_path = name if path == "." else f"{path}/{name}"
 
-        errors.append(f"{repo}: HTTP {code} - {body}")
+    encoded_src = urllib.parse.quote(relative_path, safe="/")
+    encoded_to = urllib.parse.quote(f"/{dst_repo}/{relative_path}", safe="")
 
-    fail(
-        "aucun repo local valide trouvé pour faire le move.\n\n"
-        "Soit ton archive n'est présente que dans un virtual/remote,\n"
-        "soit il faut donner directement le vrai repo local source.\n\n"
-        + ("\n\nDétails:\n- " + "\n- ".join(errors) if errors else "")
+    copy_url = (
+        f"{art_url}/api/copy/{src_repo}/{encoded_src}"
+        f"?to={encoded_to}&suppressLayouts=1"
     )
+
+    print(f"\nCopie de {src_repo}/{relative_path} vers {dst_repo}/{relative_path} ...")
+    code, body = api_post(copy_url, token, body=b"")
+
+    if code != 200:
+        fail(f"échec copie\n{body}")
+
+    print("\nCopie OK")
+    print(f"Source      : {src_repo}/{relative_path}")
+    print(f"Destination : {dst_repo}/{relative_path}")
+    print(body)
 
 
 if __name__ == "__main__":
